@@ -43,15 +43,19 @@ impl Backoff {
 
     #[inline]
     pub fn spin(&self) {
-        for _ in 0..1 << self.rounds.get() {
-            self.spin_once();
+        for _ in 0..1 << self.rounds.get().min(SPIN_LIMIT) {
+            std::hint::spin_loop();
+        }
+
+        if self.rounds.get() <= SPIN_LIMIT {
+            self.rounds.set(self.rounds.get() + 1);
         }
     }
 
     #[inline]
     pub fn snooze(&self) {
         if self.rounds.get() <= SPIN_LIMIT {
-            self.spin();
+            std::hint::spin_loop();
         } else {
             std::thread::yield_now();
         }
