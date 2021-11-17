@@ -13,7 +13,6 @@ license = "Apache-2.0/MIT"
 crossbeam = "0.8.1"
 criterion = "0.3.5"
 
-
 [[bench]]
 name = "basic"
 harness = false
