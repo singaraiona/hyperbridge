@@ -10,8 +10,8 @@ license = "Apache-2.0/MIT"
 [dependencies]
 
 [dev-dependencies]
-crossbeam = "*"
-criterion = "*"
+crossbeam = "0.8.1"
+criterion = "0.3.5"
 
 
 [[bench]]
