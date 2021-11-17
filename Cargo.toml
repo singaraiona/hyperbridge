@@ -1,0 +1,19 @@
+[package]
+name = "hyperbridge"
+version = "0.1.0"
+edition = "2018"
+authors = ["Anton Kundenko <singaraiona@gmail.com>"]
+description = "Fast multi-producer multi-consumer channel with async support"
+repository = "https://github.com/singaraiona/hyperbridge"
+license = "Apache-2.0/MIT"
+
+[dependencies]
+
+[dev-dependencies]
+crossbeam = "*"
+criterion = "*"
+
+
+[[bench]]
+name = "basic"
+harness = false
