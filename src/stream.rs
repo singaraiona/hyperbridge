@@ -12,6 +12,15 @@ pub struct Sender<T: Send + 'static> {
     wakers: channel::Receiver<Arc<AtomicWaker>>,
 }
 
+impl<T: Send + 'static> Clone for Sender<T> {
+    fn clone(&self) -> Self {
+        Sender {
+            tx: self.tx.clone(),
+            wakers: self.wakers.clone(),
+        }
+    }
+}
+
 impl<T> Sink<T> for Sender<T>
 where
     T: Send + Unpin + 'static,
@@ -48,6 +57,16 @@ pub struct Receiver<T: Send + 'static> {
     wakers: channel::Sender<Arc<AtomicWaker>>,
 }
 
+impl<T: Send + 'static> Clone for Receiver<T> {
+    fn clone(&self) -> Self {
+        Receiver {
+            rx: self.rx.clone(),
+            waker: Arc::new(AtomicWaker::new()),
+            wakers: self.wakers.clone(),
+        }
+    }
+}
+
 impl<T: Send + 'static> Receiver<T> {
     #[inline]
     fn next_message(&self) -> Poll<Option<Result<T, io::Error>>> {
@@ -79,4 +98,19 @@ impl<T: Send + 'static> Stream for Receiver<T> {
             }
         }
     }
+}
+
+pub fn new<T: Send + 'static>() -> (Sender<T>, Receiver<T>) {
+    let (tx, rx) = channel::new();
+    let (wakers_tx, wakers_rx) = channel::new();
+    let tx = Sender {
+        tx: tx,
+        wakers: wakers_rx,
+    };
+    let rx = Receiver {
+        rx: rx,
+        wakers: wakers_tx,
+        waker: Arc::new(AtomicWaker::new()),
+    };
+    (tx, rx)
 }

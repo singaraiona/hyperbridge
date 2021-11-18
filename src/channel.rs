@@ -412,10 +412,7 @@ impl<T: Send + 'static> Sender<T> {
     }
 }
 
-impl<T> Clone for Sender<T>
-where
-    T: Send + 'static,
-{
+impl<T: Send + 'static> Clone for Sender<T> {
     fn clone(&self) -> Self {
         Sender {
             chan: Arc::clone(&self.chan),
@@ -446,10 +443,7 @@ impl<T: Send + 'static> Receiver<T> {
     }
 }
 
-impl<T> Clone for Receiver<T>
-where
-    T: Send + 'static,
-{
+impl<T: Send + 'static> Clone for Receiver<T> {
     fn clone(&self) -> Self {
         Receiver {
             chan: Arc::clone(&self.chan),
