@@ -2,7 +2,7 @@
 extern crate criterion;
 
 use criterion::{Bencher, Criterion};
-use hyperbridge;
+use hyperbridge::channel;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
@@ -13,7 +13,7 @@ const THREADS: usize = 16;
 
 fn test_hyperbridge_mpsc(b: &mut Bencher) {
     b.iter(|| {
-        let (sender, receiver) = hyperbridge::new();
+        let (sender, receiver) = channel::new();
         let mut counter = 0;
 
         let mut handles = vec![];
@@ -91,7 +91,7 @@ fn test_crossbeam_mpsc(b: &mut Bencher) {
 
 fn test_hyperbridge_mpmc(b: &mut Bencher) {
     b.iter(|| {
-        let (sender, receiver) = hyperbridge::new();
+        let (sender, receiver) = channel::new();
         let counter = Arc::new(AtomicUsize::new(0));
 
         let mut handles = vec![];
