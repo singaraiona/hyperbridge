@@ -8,7 +8,7 @@ repository = "https://github.com/singaraiona/hyperbridge"
 license = "Apache-2.0/MIT"
 
 [dependencies]
-futures = { version = "0.3.17", optional = true }
+futures = { version = "^0.3.15", optional = true }
 
 [dev-dependencies]
 crossbeam = "0.8.1"
