@@ -87,7 +87,6 @@ pub fn new<T: Send + 'static>() -> (Sender<T>, Receiver<T>) {
     };
     let rx = Receiver {
         rx: rx,
-        wakers: wakers_tx,
         waker: rx_waker,
     };
     (tx, rx)
