@@ -86,13 +86,13 @@ impl<T: Send + 'static> Stream for Receiver<T> {
         loop {
             // It's not our event, wait until our waker is waked
             if Arc::strong_count(&self.waker) > 1 {
+                self.waker.register(cx.waker());
                 return Poll::Pending;
             }
 
             match self.next_message() {
                 Poll::Ready(res) => return Poll::Ready(res),
                 Poll::Pending => {
-                    self.waker.register(cx.waker());
                     self.wakers.send(self.waker.clone())?;
                 }
             }
