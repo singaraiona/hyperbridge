@@ -36,9 +36,7 @@ where
     }
 
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        if let Ok(Some(waker)) = self.wakers.try_recv() {
-            waker.wake();
-        }
+        self.rx_waker.wake();
         Poll::Ready(Ok(()))
     }
 
@@ -82,15 +80,15 @@ impl<T: Send + 'static> Stream for Receiver<T> {
 
 pub fn new<T: Send + 'static>() -> (Sender<T>, Receiver<T>) {
     let (tx, rx) = channel::new();
-    let (wakers_tx, wakers_rx) = channel::new();
+    let rx_waker = Arc::new(AtomicWaker::new());
     let tx = Sender {
         tx: tx,
-        wakers: wakers_rx,
+        rx_waker: rx_waker.clone(),
     };
     let rx = Receiver {
         rx: rx,
         wakers: wakers_tx,
-        waker: Arc::new(AtomicWaker::new()),
+        waker: rx_waker,
     };
     (tx, rx)
 }
