@@ -8,16 +8,19 @@ use core::sync::atomic::{AtomicPtr, AtomicUsize};
 use std::sync::Arc;
 use std::{fmt, io};
 
-const FREE: usize = 0;
+// slot states
 const OCCUPIED: usize = 1;
 const READ: usize = 1 << 1;
-const CLOSED: usize = 1 << 2;
 const DESTROY: usize = 1 << 3;
+// index offset inside each block
 const INDEX_SHIFT: usize = 48;
-const MARK_SHIFT: usize = 63;
-const MARK_BIT: usize = 1 << MARK_SHIFT;
-const INDEX_MASK: usize = (usize::MAX << INDEX_SHIFT) & !MARK_BIT;
-const BLOCK_MASK: usize = !(INDEX_MASK | MARK_BIT);
+// indicates that channel was closed
+const CLOSED_FLAG: usize = 1;
+// indicates that head and tail are in the same block
+const SAME_BLOCK_FLAG: usize = 1 << 1;
+const FLAGS: usize = CLOSED_FLAG | SAME_BLOCK_FLAG;
+const INDEX_MASK: usize = (usize::MAX << INDEX_SHIFT) & !FLAGS;
+const BLOCK_MASK: usize = !(INDEX_MASK | FLAGS);
 const BLOCK_SIZE: usize = 64;
 
 struct Slot<T: Send> {
@@ -87,7 +90,7 @@ impl<T: Send> Block<T> {
 struct Position<T: Send> {
     block: *mut Block<T>,
     index: usize,
-    marked: bool,
+    flags: usize,
 }
 
 impl<T: Send> fmt::Debug for Position<T> {
@@ -104,17 +107,17 @@ impl<T: Send> Position<T> {
     fn unpack(val: usize) -> Self {
         let block = (val & BLOCK_MASK) as *mut Block<T>;
         let index = (val & INDEX_MASK) >> INDEX_SHIFT;
-        let marked = val & MARK_BIT == MARK_BIT;
+        let flags = val & FLAGS;
         Position {
             block,
             index,
-            marked,
+            flags,
         }
     }
 
     #[inline]
     fn pack(&self) -> usize {
-        self.block as usize | (self.index << INDEX_SHIFT) | (self.marked as usize) << MARK_SHIFT
+        self.block as usize | (self.index << INDEX_SHIFT) | self.flags
     }
 
     #[inline]
@@ -122,7 +125,7 @@ impl<T: Send> Position<T> {
         Position {
             block: self.block,
             index: self.index + 1,
-            marked: self.marked,
+            flags: self.flags,
         }
     }
 
@@ -196,7 +199,7 @@ impl<T: Send> Channel<T> {
             let tail: Position<T> = Position::unpack(tail_packed);
 
             // channel is closed
-            if tail.marked {
+            if tail.flags & CLOSED_FLAG == CLOSED_FLAG {
                 return Err(io::Error::new(
                     io::ErrorKind::BrokenPipe,
                     "channel is closed",
@@ -254,8 +257,16 @@ impl<T: Send> Channel<T> {
                 continue;
             }
 
+            // channel is closed
+            if head.flags & CLOSED_FLAG == CLOSED_FLAG {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "channel is closed",
+                ));
+            }
+
             // head and tail are in the same block
-            if !head.marked {
+            if head.flags & SAME_BLOCK_FLAG == 0 {
                 let tail_packed = self.tail.load(Acquire);
 
                 // Nothing to read
@@ -263,7 +274,10 @@ impl<T: Send> Channel<T> {
                     return Ok(None);
                 }
 
-                head.marked = true;
+                let tail: Position<T> = Position::unpack(tail_packed);
+                if head.block != tail.block {
+                    head.flags |= SAME_BLOCK_FLAG;
+                }
             }
 
             let slot = head.slot();
@@ -282,41 +296,23 @@ impl<T: Send> Channel<T> {
                         self.head.store(next_block_ptr as usize, Release);
                     }
 
-                    loop {
-                        let state = slot.state.load(Acquire) & !DESTROY;
-
-                        match state {
-                            OCCUPIED => {
-                                let msg = unsafe { slot.message.get().read().assume_init() };
-
-                                // this is the last block, so start destroying it
-                                if head.index + 1 == BLOCK_SIZE {
-                                    Block::destroy(head.block, 0);
-                                }
-                                // someone started block destroy
-                                else if slot.state.fetch_or(READ, AcqRel) & DESTROY != 0 {
-                                    Block::destroy(head.block, head.index + 1);
-                                }
-
-                                return Ok(Some(msg));
-                            }
-
-                            // wait for write operation to complete
-                            FREE => {
-                                backoff.spin();
-                                continue;
-                            }
-
-                            CLOSED => {
-                                return Err(io::Error::new(
-                                    io::ErrorKind::BrokenPipe,
-                                    "channel is closed",
-                                ))
-                            }
-
-                            _ => panic!("channel is in corrupted state: {}", state),
-                        }
+                    // wait until write operation completes
+                    while slot.state.load(Acquire) & OCCUPIED == 0 {
+                        backoff.spin();
                     }
+
+                    let msg = unsafe { slot.message.get().read().assume_init() };
+
+                    // this is the last block, so start destroying it
+                    if head.index + 1 == BLOCK_SIZE {
+                        Block::destroy(head.block, 0);
+                    }
+                    // someone started block destroy
+                    else if slot.state.fetch_or(READ, AcqRel) & DESTROY != 0 {
+                        Block::destroy(head.block, head.index + 1);
+                    }
+
+                    return Ok(Some(msg));
                 }
 
                 Err(h) => {
@@ -337,36 +333,8 @@ impl<T: Send> Channel<T> {
 
     #[inline]
     fn close(&self) {
-        let backoff = Backoff::new();
-
-        loop {
-            let tail_packed = self.tail.load(Acquire);
-            let tail: Position<T> = Position::unpack(tail_packed);
-            let slot = tail.slot();
-
-            // channel is already closed
-            if tail.marked {
-                return;
-            }
-
-            // wait next block
-            if tail.index == BLOCK_SIZE {
-                backoff.snooze();
-                continue;
-            }
-
-            if self
-                .tail
-                .compare_exchange_weak(tail_packed, tail_packed | MARK_BIT, SeqCst, Relaxed)
-                .is_err()
-            {
-                backoff.snooze();
-                continue;
-            }
-
-            slot.state.store(CLOSED, Release);
-            return;
-        }
+        self.tail.fetch_or(CLOSED_FLAG, AcqRel);
+        self.head.fetch_or(CLOSED_FLAG, AcqRel);
     }
 }
 
