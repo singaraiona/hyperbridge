@@ -4,7 +4,7 @@ extern crate test;
 
 use core::sync::atomic::AtomicUsize;
 use core::sync::atomic::Ordering::Relaxed;
-use hyperbridge::*;
+use hyperbridge::channel;
 use std::sync::Arc;
 use std::thread;
 
@@ -13,7 +13,7 @@ const THREADS: usize = 16;
 
 #[test]
 fn hyperbridge_mpsc() {
-    let (sender, receiver) = new();
+    let (sender, receiver) = channel::new();
     let mut counter = 0;
 
     let mut handles = vec![];
@@ -51,7 +51,7 @@ fn hyperbridge_mpsc() {
 
 #[test]
 fn hyperbridge_mpmc() {
-    let (sender, receiver) = new();
+    let (sender, receiver) = channel::new();
     let counter = Arc::new(AtomicUsize::new(0));
 
     let mut handles = vec![];
