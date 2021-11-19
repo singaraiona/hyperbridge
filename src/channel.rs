@@ -401,6 +401,12 @@ impl<T: Send + 'static> Sender<T> {
     pub fn close(&self) {
         self.chan.close()
     }
+
+    pub fn receiver(&self) -> Receiver<T> {
+        Receiver {
+            chan: self.chan.clone(),
+        }
+    }
 }
 
 impl<T: Send + 'static> Clone for Sender<T> {
