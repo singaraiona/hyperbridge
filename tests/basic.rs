@@ -12,6 +12,46 @@ const VALUES: usize = 10000;
 const THREADS: usize = 16;
 
 #[test]
+fn hyperbridge_close() {
+    let (sender, receiver) = channel::new();
+    let mut counter = 0;
+
+    let mut handles = vec![];
+
+    for i in 0..THREADS {
+        let ch = sender.clone();
+        let jh = thread::spawn(move || {
+            for _ in 0..VALUES {
+                ch.send(i).unwrap();
+            }
+        });
+        handles.push(jh);
+    }
+
+    for jh in handles.drain(..) {
+        let _ = jh.join();
+    }
+
+    sender.close();
+
+    let mut iters = THREADS * VALUES;
+
+    while iters > 0 {
+        match receiver.try_recv() {
+            Ok(Some(v)) => {
+                counter += v as usize;
+                iters -= 1;
+            }
+            _ => {}
+        }
+    }
+
+    let total = (0..THREADS).map(|i| i * VALUES).sum();
+
+    assert_eq!(counter, total);
+}
+
+#[test]
 fn hyperbridge_mpsc() {
     let (sender, receiver) = channel::new();
     let mut counter = 0;

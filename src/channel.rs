@@ -277,20 +277,19 @@ impl<T: Send> Channel<T> {
                 continue;
             }
 
-            // channel is closed
-            if head.flags & CLOSED_FLAG == CLOSED_FLAG {
-                return Err(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "channel is closed",
-                ));
-            }
-
             // head and tail are in the same block
             if head.flags & SAME_BLOCK_FLAG == 0 {
                 let tail_packed = self.tail.load(Acquire);
 
                 // Nothing to read
-                if head_packed == tail_packed {
+                if head_packed & !FLAGS == tail_packed & !FLAGS {
+                    // channel is closed
+                    if head.flags & CLOSED_FLAG == CLOSED_FLAG {
+                        return Err(io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            "channel is closed",
+                        ));
+                    }
                     return Ok(None);
                 }
 
@@ -313,7 +312,10 @@ impl<T: Send> Channel<T> {
                     // last slot in a block
                     if head.index + 1 == BLOCK_SIZE {
                         let next_block_ptr = unsafe { (*head.block).wait_next() };
-                        self.head.store(next_block_ptr as usize, Release);
+                        self.head.store(
+                            (head.flags & CLOSED_FLAG) | next_block_ptr as usize,
+                            Release,
+                        );
                     }
 
                     // wait until write operation completes
