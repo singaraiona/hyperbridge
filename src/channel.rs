@@ -280,9 +280,10 @@ impl<T: Send> Channel<T> {
             // head and tail are in the same block
             if head.flags & SAME_BLOCK_FLAG == 0 {
                 let tail_packed = self.tail.load(Acquire);
+                let tail: Position<T> = Position::unpack(tail_packed);
 
                 // Nothing to read
-                if head_packed & !FLAGS == tail_packed & !FLAGS {
+                if head.block == tail.block && head.index >= tail.index {
                     // channel is closed
                     if head.flags & CLOSED_FLAG == CLOSED_FLAG {
                         return Err(io::Error::new(
@@ -293,7 +294,6 @@ impl<T: Send> Channel<T> {
                     return Ok(None);
                 }
 
-                let tail: Position<T> = Position::unpack(tail_packed);
                 if head.block != tail.block {
                     head.flags |= SAME_BLOCK_FLAG;
                 }
