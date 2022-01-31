@@ -381,15 +381,15 @@ impl<T: Send> fmt::Debug for Channel<T> {
 // Helpers struct holds together receivers and senders rc's
 // for handling drops of each side of channel (all senders or all receivers)
 // and calling close on entire channel for that
-struct Counters {
-    receivers: AtomicUsize,
-    senders: AtomicUsize,
+pub(crate) struct Counters {
+    pub(crate) receivers: AtomicUsize,
+    pub(crate) senders: AtomicUsize,
 }
 
 /// Tx handle to a channel. Can be cloned
 pub struct Sender<T: Send + 'static> {
     chan: Arc<Channel<T>>,
-    cnts: Arc<Counters>,
+    pub(crate) cnts: Arc<Counters>,
 }
 
 impl<T: Send> fmt::Debug for Sender<T> {
@@ -447,7 +447,7 @@ unsafe impl<T: Send + 'static> Send for Sender<T> {}
 /// Rx handle to a channel. Can be cloned
 pub struct Receiver<T: Send + 'static> {
     chan: Arc<Channel<T>>,
-    cnts: Arc<Counters>,
+    pub(crate) cnts: Arc<Counters>,
 }
 
 impl<T: Send + 'static> Receiver<T> {

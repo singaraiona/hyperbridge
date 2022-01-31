@@ -5,6 +5,7 @@ use futures::stream::Stream;
 use futures::task::AtomicWaker;
 use std::io;
 use std::pin::Pin;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 pub struct Sender<T: Send + 'static> {
@@ -44,6 +45,18 @@ where
         self.tx.close();
         self.rx_waker.wake();
         Poll::Ready(Ok(()))
+    }
+}
+
+impl<T: Send + 'static> Drop for Sender<T> {
+    fn drop(&mut self) {
+        // check if it was the last sender
+        let senders = self.tx.cnts.senders.load(Ordering::SeqCst);
+        // if so - close entire channel and wake up receiver
+        if senders == 1 {
+            self.tx.close();
+            self.rx_waker.wake();
+        }
     }
 }
 
