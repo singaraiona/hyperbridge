@@ -129,3 +129,95 @@ fn hyperbridge_mpmc() {
 
     assert_eq!(counter.load(Relaxed), total);
 }
+
+#[test]
+fn hyperbridge_drop_senders() {
+    let (sender, receiver) = channel::new();
+    let mut counter = 0;
+
+    let mut handles = vec![];
+
+    for i in 0..THREADS {
+        let ch = sender.clone();
+        let jh = thread::spawn(move || {
+            for _ in 0..VALUES {
+                ch.send(i).unwrap();
+            }
+        });
+        handles.push(jh);
+    }
+
+    for jh in handles.drain(..) {
+        let _ = jh.join();
+    }
+
+    let mut iters = THREADS * VALUES;
+
+    while iters > 0 {
+        match receiver.try_recv() {
+            Ok(Some(v)) => {
+                counter += v as usize;
+                iters -= 1;
+            }
+            _ => {}
+        }
+    }
+
+    let total = (0..THREADS).map(|i| i * VALUES).sum();
+
+    assert_eq!(counter, total);
+
+    // should call close on drop last sender
+    drop(sender);
+
+    match receiver.try_recv() {
+        Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::BrokenPipe),
+        _ => panic!("expected closed channel"),
+    }
+}
+
+#[test]
+fn hyperbridge_drop_receiver() {
+    let (sender, receiver) = channel::new();
+    let mut counter = 0;
+
+    let mut handles = vec![];
+
+    for i in 0..THREADS {
+        let ch = sender.clone();
+        let jh = thread::spawn(move || {
+            for _ in 0..VALUES {
+                ch.send(i).unwrap();
+            }
+        });
+        handles.push(jh);
+    }
+
+    for jh in handles.drain(..) {
+        let _ = jh.join();
+    }
+
+    let mut iters = THREADS * VALUES;
+
+    while iters > 0 {
+        match receiver.try_recv() {
+            Ok(Some(v)) => {
+                counter += v as usize;
+                iters -= 1;
+            }
+            _ => {}
+        }
+    }
+
+    let total = (0..THREADS).map(|i| i * VALUES).sum();
+
+    assert_eq!(counter, total);
+
+    // should call close on drop last receiver
+    drop(receiver);
+
+    match sender.send(0) {
+        Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::BrokenPipe),
+        _ => panic!("expected closed channel"),
+    }
+}
