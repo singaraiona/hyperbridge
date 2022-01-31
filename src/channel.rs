@@ -5,7 +5,6 @@ use core::mem::MaybeUninit;
 use core::ops::Deref;
 use core::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release, SeqCst};
 use core::sync::atomic::{AtomicPtr, AtomicUsize};
-use std::cmp::Ordering;
 use std::sync::Arc;
 use std::{fmt, io};
 
@@ -379,10 +378,18 @@ impl<T: Send> fmt::Debug for Channel<T> {
     }
 }
 
+// Helpers struct holds together receivers and senders rc's
+// for handling drops of each side of channel (all senders or all receivers)
+// and calling close on entire channel for that
+struct Counters {
+    receivers: AtomicUsize,
+    senders: AtomicUsize,
+}
+
 /// Tx handle to a channel. Can be cloned
 pub struct Sender<T: Send + 'static> {
-    snds: Arc<AtomicUsize>,
     chan: Arc<Channel<T>>,
+    cnts: Arc<Counters>,
 }
 
 impl<T: Send> fmt::Debug for Sender<T> {
@@ -405,21 +412,29 @@ impl<T: Send + 'static> Sender<T> {
     pub fn close(&self) {
         self.chan.close()
     }
+
+    pub fn receiver(&self) -> Receiver<T> {
+        self.cnts.receivers.fetch_add(1, SeqCst);
+        Receiver {
+            chan: Arc::clone(&self.chan),
+            cnts: self.cnts.clone(),
+        }
+    }
 }
 
 impl<T: Send + 'static> Clone for Sender<T> {
     fn clone(&self) -> Self {
-        self.snds.fetch_add(1, SeqCst);
+        self.cnts.senders.fetch_add(1, SeqCst);
         Sender {
-            snds: self.snds.clone(),
             chan: Arc::clone(&self.chan),
+            cnts: self.cnts.clone(),
         }
     }
 }
 
 impl<T: Send + 'static> Drop for Sender<T> {
     fn drop(&mut self) {
-        let senders = self.snds.fetch_sub(1, SeqCst);
+        let senders = self.cnts.senders.fetch_sub(1, SeqCst);
         // if it was the last sender - close channel
         if senders == 1 {
             self.chan.close();
@@ -431,8 +446,8 @@ unsafe impl<T: Send + 'static> Send for Sender<T> {}
 
 /// Rx handle to a channel. Can be cloned
 pub struct Receiver<T: Send + 'static> {
-    recs: Arc<AtomicUsize>,
     chan: Arc<Channel<T>>,
+    cnts: Arc<Counters>,
 }
 
 impl<T: Send + 'static> Receiver<T> {
@@ -440,21 +455,29 @@ impl<T: Send + 'static> Receiver<T> {
     pub fn try_recv(&self) -> io::Result<Option<T>> {
         self.chan.try_recv()
     }
+
+    pub fn sender(&self) -> Sender<T> {
+        self.cnts.senders.fetch_add(1, SeqCst);
+        Sender {
+            chan: Arc::clone(&self.chan),
+            cnts: self.cnts.clone(),
+        }
+    }
 }
 
 impl<T: Send + 'static> Clone for Receiver<T> {
     fn clone(&self) -> Self {
-        self.recs.fetch_add(1, SeqCst);
+        self.cnts.receivers.fetch_add(1, SeqCst);
         Receiver {
-            recs: self.recs.clone(),
             chan: Arc::clone(&self.chan),
+            cnts: self.cnts.clone(),
         }
     }
 }
 
 impl<T: Send + 'static> Drop for Receiver<T> {
     fn drop(&mut self) {
-        let receivers = self.recs.fetch_sub(1, SeqCst);
+        let receivers = self.cnts.receivers.fetch_sub(1, SeqCst);
         // if it was the last receiver - close channel
         if receivers == 1 {
             self.chan.close();
@@ -467,13 +490,17 @@ unsafe impl<T: Send + 'static> Send for Receiver<T> {}
 /// Creates a new channel and splits it ro a Tx, Rx pair
 pub fn new<T: Send + 'static>() -> (Sender<T>, Receiver<T>) {
     let chan = Arc::new(Channel::new());
+    let cnts = Arc::new(Counters {
+        receivers: AtomicUsize::new(1),
+        senders: AtomicUsize::new(1),
+    });
     let tx = Sender {
-        snds: Arc::new(AtomicUsize::new(1)),
         chan: chan.clone(),
+        cnts: cnts.clone(),
     };
     let rx = Receiver {
-        recs: Arc::new(AtomicUsize::new(1)),
         chan: chan.clone(),
+        cnts: cnts,
     };
     (tx, rx)
 }
