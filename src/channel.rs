@@ -9,9 +9,7 @@ use std::sync::Arc;
 use std::{fmt, io};
 
 // Slot states
-const OCCUPIED: usize = 1;
-const READ: usize = 1 << 1;
-const DESTROY: usize = 1 << 3;
+const WROTE: usize = 1;
 // Index offset inside each block
 const INDEX_SHIFT: usize = 48;
 // Indicates that channel was closed
@@ -72,21 +70,7 @@ impl<T: Send> Block<T> {
         next
     }
 
-    /// Drop block if there are no readers using this block remains or leave dropping to a next thread
-    fn destroy(this: *mut Block<T>, start: usize) {
-        // we can skip marking the last block with DESTROY because it has started destroy process
-        for i in start..BLOCK_SIZE - 1 {
-            let slot = unsafe { (*this).slots.get_unchecked(i) };
-
-            // set DESTROY bit if someone is still reading from this slot.
-            if slot.state.load(Acquire) & READ == 0
-                && slot.state.fetch_or(DESTROY, AcqRel) & READ == 0
-            {
-                // if someone is still using the slot, it will continue destruction of the block.
-                return;
-            }
-        }
-
+    fn destroy(this: *mut Block<T>) {
         // noone is using the block, now it is safe to destroy it.
         unsafe { drop(Box::from_raw(this)) };
     }
@@ -246,7 +230,7 @@ impl<T: Send> Channel<T> {
                     }
 
                     unsafe { slot.message.get().write(MaybeUninit::new(msg)) };
-                    slot.state.store(OCCUPIED, Release);
+                    slot.state.store(WROTE, Release);
                     return Ok(());
                 }
                 Err(t) => {
@@ -262,62 +246,33 @@ impl<T: Send> Channel<T> {
     /// Can fail or return uncompleted.
     #[inline]
     fn try_recv(&self) -> io::Result<Option<T>> {
-        let backoff = Backoff::new();
-        let mut head_packed = self.head.load(Acquire);
+        let head_packed = self.head.load(Relaxed);
+        let head: Position<T> = Position::unpack(head_packed);
+        let slot = head.slot();
 
-        loop {
-            let head: Position<T> = Position::unpack(head_packed);
-
-            // wait next block
-            if head.index == BLOCK_SIZE {
-                backoff.snooze();
-                head_packed = self.head.load(Acquire);
-                continue;
-            }
-
-            let slot = head.slot();
-            if slot.state.load(Acquire) & OCCUPIED == 0 {
-                return Ok(None);
-            }
-
-            // try to move head forward
-            match self.head.compare_exchange_weak(
-                head_packed,
-                head.increment().pack(),
-                SeqCst,
-                Relaxed,
-            ) {
-                Ok(_) => {
-                    // last slot in a block
-                    if head.index + 1 == BLOCK_SIZE {
-                        let next_block_ptr = unsafe { (*head.block).wait_next() };
-                        self.head.store(
-                            (head.flags & CLOSED_FLAG) | next_block_ptr as usize,
-                            Release,
-                        );
-                    }
-
-                    let msg = unsafe { slot.message.get().read().assume_init() };
-
-                    // this is the last block, so start destroying it
-                    if head.index + 1 == BLOCK_SIZE {
-                        Block::destroy(head.block, 0);
-                    }
-                    // someone started block destroy
-                    else if slot.state.fetch_or(READ, AcqRel) & DESTROY != 0 {
-                        Block::destroy(head.block, head.index + 1);
-                    }
-
-                    return Ok(Some(msg));
-                }
-
-                Err(h) => {
-                    head_packed = h;
-                    backoff.spin();
-                    continue;
-                }
-            }
+        if slot.state.load(Relaxed) & WROTE == 0 {
+            return Ok(None);
         }
+
+        // last slot in a block
+        if head.index + 1 == BLOCK_SIZE {
+            let next_block_ptr = unsafe { (*head.block).wait_next() };
+            self.head.store(
+                (head.flags & CLOSED_FLAG) | next_block_ptr as usize,
+                Release,
+            );
+        } else {
+            self.head.store(head.increment().pack(), Relaxed);
+        }
+
+        let msg = unsafe { slot.message.get().read().assume_init() };
+
+        // this is the last block, so start destroying it
+        if head.index + 1 == BLOCK_SIZE {
+            Block::destroy(head.block);
+        }
+
+        Ok(Some(msg))
     }
 
     /// Check if there are no mesages in a channel

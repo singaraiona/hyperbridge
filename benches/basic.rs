@@ -175,12 +175,12 @@ fn test_crossbeam_mpmc(b: &mut Bencher) {
 
 fn hyperbridge_channel(b: &mut Criterion) {
     b.bench_function("hyperbridge-mpsc", |b| test_hyperbridge_mpsc(b));
-    b.bench_function("hyperbridge-mpmc", |b| test_hyperbridge_mpmc(b));
+    // b.bench_function("hyperbridge-mpmc", |b| test_hyperbridge_mpmc(b));
 }
 
 fn crossbeam_channel(b: &mut Criterion) {
     b.bench_function("crossbeam-mpsc", |b| test_crossbeam_mpsc(b));
-    b.bench_function("crossbeam-mpmc", |b| test_crossbeam_mpmc(b));
+    // b.bench_function("crossbeam-mpmc", |b| test_crossbeam_mpmc(b));
 }
 
 criterion_group!(compare, hyperbridge_channel, crossbeam_channel);
