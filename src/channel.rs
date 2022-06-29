@@ -16,9 +16,7 @@ const DESTROY: usize = 1 << 3;
 const INDEX_SHIFT: usize = 48;
 // Indicates that channel was closed
 const CLOSED_FLAG: usize = 1;
-// Indicates that head and tail are in the same block
-const SAME_BLOCK_FLAG: usize = 1 << 1;
-const FLAGS: usize = CLOSED_FLAG | SAME_BLOCK_FLAG;
+const FLAGS: usize = CLOSED_FLAG;
 const INDEX_MASK: usize = (usize::MAX << INDEX_SHIFT) & !FLAGS;
 const BLOCK_MASK: usize = !(INDEX_MASK | FLAGS);
 // Each block capacity
@@ -268,7 +266,7 @@ impl<T: Send> Channel<T> {
         let mut head_packed = self.head.load(Acquire);
 
         loop {
-            let mut head: Position<T> = Position::unpack(head_packed);
+            let head: Position<T> = Position::unpack(head_packed);
 
             // wait next block
             if head.index == BLOCK_SIZE {
@@ -277,29 +275,10 @@ impl<T: Send> Channel<T> {
                 continue;
             }
 
-            // head and tail are in the same block
-            if head.flags & SAME_BLOCK_FLAG == 0 {
-                let tail_packed = self.tail.load(Acquire);
-                let tail: Position<T> = Position::unpack(tail_packed);
-
-                // Nothing to read
-                if head.block == tail.block && head.index >= tail.index {
-                    // channel is closed
-                    if head.flags & CLOSED_FLAG == CLOSED_FLAG {
-                        return Err(io::Error::new(
-                            io::ErrorKind::BrokenPipe,
-                            "channel is closed",
-                        ));
-                    }
-                    return Ok(None);
-                }
-
-                if head.block != tail.block {
-                    head.flags |= SAME_BLOCK_FLAG;
-                }
-            }
-
             let slot = head.slot();
+            if slot.state.load(Acquire) & OCCUPIED == 0 {
+                return Ok(None);
+            }
 
             // try to move head forward
             match self.head.compare_exchange_weak(
@@ -316,11 +295,6 @@ impl<T: Send> Channel<T> {
                             (head.flags & CLOSED_FLAG) | next_block_ptr as usize,
                             Release,
                         );
-                    }
-
-                    // wait until write operation completes
-                    while slot.state.load(Acquire) & OCCUPIED == 0 {
-                        backoff.spin();
                     }
 
                     let msg = unsafe { slot.message.get().read().assume_init() };
