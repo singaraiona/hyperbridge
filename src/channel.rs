@@ -268,6 +268,14 @@ impl<T: Send> Channel<T> {
         loop {
             let head: Position<T> = Position::unpack(head_packed);
 
+            // channel is closed
+            if head.flags & CLOSED_FLAG == CLOSED_FLAG {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "channel is closed",
+                ));
+            }
+
             // wait next block
             if head.index == BLOCK_SIZE {
                 backoff.snooze();
