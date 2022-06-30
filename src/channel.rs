@@ -276,11 +276,9 @@ impl<T: Send> Channel<T> {
                 ));
             }
 
-            // wait next block
+            // next block is not set up yet
             if head.index == BLOCK_SIZE {
-                backoff.snooze();
-                head_packed = self.head.load(Acquire);
-                continue;
+                return Ok(None);
             }
 
             let slot = head.slot();
