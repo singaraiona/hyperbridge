@@ -4,7 +4,7 @@ use core::marker::PhantomData;
 use core::mem::MaybeUninit;
 use core::ops::Deref;
 use core::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release, SeqCst};
-use core::sync::atomic::{AtomicPtr, AtomicUsize};
+use core::sync::atomic::{fence, AtomicPtr, AtomicUsize};
 use std::sync::Arc;
 use std::{fmt, io};
 
@@ -266,20 +266,21 @@ impl<T: Send> Channel<T> {
     fn try_recv(&self) -> io::Result<Option<T>> {
         let backoff = Backoff::new();
         let mut head_packed = self.head.load(Acquire);
+        let mut head: Position<T> = Position::unpack(head_packed);
 
         loop {
-            let mut head: Position<T> = Position::unpack(head_packed);
-
             // wait next block
             if head.index == BLOCK_SIZE {
                 backoff.snooze();
                 head_packed = self.head.load(Acquire);
+                head = Position::unpack(head_packed);
                 continue;
             }
 
             // head and tail are in the same block
             if head.flags & SAME_BLOCK_FLAG == 0 {
-                let tail_packed = self.tail.load(Acquire);
+                fence(SeqCst);
+                let tail_packed = self.tail.load(Relaxed);
                 let tail: Position<T> = Position::unpack(tail_packed);
 
                 // Nothing to read
@@ -339,8 +340,8 @@ impl<T: Send> Channel<T> {
 
                 Err(h) => {
                     head_packed = h;
+                    head = Position::unpack(head_packed);
                     backoff.spin();
-                    continue;
                 }
             }
         }
