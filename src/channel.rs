@@ -11,7 +11,7 @@ use std::{fmt, io};
 // Slot states
 const OCCUPIED: usize = 1;
 const READ: usize = 1 << 1;
-const DESTROY: usize = 1 << 3;
+const DESTROY: usize = 1 << 2;
 // Index offset inside each block
 const INDEX_SHIFT: usize = 48;
 // Indicates that channel was closed
@@ -59,19 +59,14 @@ impl<T: Send> Block<T> {
             if !next.is_null() {
                 return next;
             }
-            backoff.snooze();
+            backoff.spin();
         }
     }
 
-    /// Jumps to a next block if stored in current `next` or stores new one
-    fn next(&self) -> *mut Block<T> {
-        let next = self.next.load(Acquire);
-        if next.is_null() {
-            let next = Self::new();
-            self.next.store(next, Release);
-            return next;
-        }
-        next
+    /// Stores new one allocated block inside `next`
+    fn set_next(&self, next: *mut Block<T>) {
+        let prev = self.next.swap(next, Release);
+        debug_assert!(prev.is_null());
     }
 
     /// Drop block if there are no readers using this block remains or leave dropping to a next thread
@@ -212,6 +207,7 @@ impl<T: Send> Channel<T> {
     fn send(&self, msg: T) -> io::Result<()> {
         let backoff = Backoff::new();
         let mut tail_packed = self.tail.load(Acquire);
+        let mut next_block: Option<*mut Block<T>> = None;
 
         loop {
             let tail: Position<T> = Position::unpack(tail_packed);
@@ -231,6 +227,11 @@ impl<T: Send> Channel<T> {
                 continue;
             }
 
+            // End of block, need to setup new one as soon as possible to reduce waiting other writing threads
+            if tail.index + 1 == BLOCK_SIZE && next_block.is_none() {
+                next_block = Some(Block::new());
+            }
+
             // try to move tail forward
             match self.tail.compare_exchange_weak(
                 tail_packed,
@@ -243,18 +244,19 @@ impl<T: Send> Channel<T> {
 
                     // End of block, need to setup new one
                     if tail.index + 1 == BLOCK_SIZE {
-                        let new_tail_packed = unsafe { (*tail.block).next() as usize };
+                        let next = next_block.unwrap();
+                        let new_tail_packed = next as usize;
                         self.tail.store(new_tail_packed, Release);
+                        unsafe { (*tail.block).set_next(next) };
                     }
 
                     unsafe { slot.message.get().write(MaybeUninit::new(msg)) };
-                    slot.state.store(OCCUPIED, Release);
+                    slot.state.fetch_or(OCCUPIED, Release);
                     return Ok(());
                 }
                 Err(t) => {
                     tail_packed = t;
                     backoff.spin();
-                    continue;
                 }
             }
         }
@@ -266,14 +268,14 @@ impl<T: Send> Channel<T> {
     fn try_recv(&self) -> io::Result<Option<T>> {
         let backoff = Backoff::new();
         let mut head_packed = self.head.load(Acquire);
-        let mut head: Position<T> = Position::unpack(head_packed);
 
         loop {
+            let mut head: Position<T> = Position::unpack(head_packed);
+
             // wait next block
             if head.index == BLOCK_SIZE {
                 backoff.snooze();
                 head_packed = self.head.load(Acquire);
-                head = Position::unpack(head_packed);
                 continue;
             }
 
@@ -321,7 +323,7 @@ impl<T: Send> Channel<T> {
 
                     // wait until write operation completes
                     while slot.state.load(Acquire) & OCCUPIED == 0 {
-                        backoff.spin();
+                        backoff.spin_once();
                     }
 
                     let msg = unsafe { slot.message.get().read().assume_init() };
@@ -340,7 +342,6 @@ impl<T: Send> Channel<T> {
 
                 Err(h) => {
                     head_packed = h;
-                    head = Position::unpack(head_packed);
                     backoff.spin();
                 }
             }
