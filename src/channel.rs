@@ -9,16 +9,16 @@ use std::sync::Arc;
 use std::{fmt, io};
 
 // Slot states
-const OCCUPIED: usize = 1;
+const WROTE: usize = 1;
 const READ: usize = 1 << 1;
-const DESTROY: usize = 1 << 3;
+const DESTROY: usize = 1 << 2;
 // Index offset inside each block
 const INDEX_SHIFT: usize = 48;
-// Indicates that channel was closed
+// In tail indicates that channel was closed
 const CLOSED_FLAG: usize = 1;
-// Indicates that head and tail are in the same block
-const SAME_BLOCK_FLAG: usize = 1 << 1;
-const FLAGS: usize = CLOSED_FLAG | SAME_BLOCK_FLAG;
+// In head indicates that head and tail are in separate blocks
+const CROSSED_FLAG: usize = 1;
+const FLAGS: usize = CLOSED_FLAG | CROSSED_FLAG;
 const INDEX_MASK: usize = (usize::MAX << INDEX_SHIFT) & !FLAGS;
 const BLOCK_MASK: usize = !(INDEX_MASK | FLAGS);
 // Each block capacity
@@ -63,15 +63,22 @@ impl<T: Send> Block<T> {
         }
     }
 
-    /// Jumps to a next block if stored in current `next` or stores new one
-    fn next(&self) -> *mut Block<T> {
+    /// Sets up a new next block
+    fn set_next(&self) -> *mut Block<T> {
+        debug_assert!(self.next.load(Acquire).is_null());
+        let next = Self::new();
+        self.next.store(next, Release);
+        next
+    }
+
+    /// Returns current next block (if any)
+    fn get_next(&self) -> Option<*mut Block<T>> {
         let next = self.next.load(Acquire);
         if next.is_null() {
-            let next = Self::new();
-            self.next.store(next, Release);
-            return next;
+            None
+        } else {
+            Some(next)
         }
-        next
     }
 
     /// Drop block if there are no readers using this block remains or leave dropping to a next thread
@@ -243,12 +250,12 @@ impl<T: Send> Channel<T> {
 
                     // End of block, need to setup new one
                     if tail.index + 1 == BLOCK_SIZE {
-                        let new_tail_packed = unsafe { (*tail.block).next() as usize };
+                        let new_tail_packed = unsafe { (*tail.block).set_next() as usize };
                         self.tail.store(new_tail_packed, Release);
                     }
 
                     unsafe { slot.message.get().write(MaybeUninit::new(msg)) };
-                    slot.state.store(OCCUPIED, Release);
+                    slot.state.fetch_or(WROTE, Release);
                     return Ok(());
                 }
                 Err(t) => {
@@ -277,26 +284,26 @@ impl<T: Send> Channel<T> {
                 continue;
             }
 
-            // head and tail are in the same block
-            if head.flags & SAME_BLOCK_FLAG == 0 {
+            // head and tail are (possibly) in the same block
+            if head.flags & CROSSED_FLAG == 0 {
                 fence(SeqCst);
                 let tail_packed = self.tail.load(Relaxed);
                 let tail: Position<T> = Position::unpack(tail_packed);
 
+                // head and tail are crossed, mark head
+                if head.block != tail.block {
+                    head.flags |= CROSSED_FLAG;
+                }
                 // Nothing to read
-                if head.block == tail.block && head.index >= tail.index {
+                else if head.index == tail.index {
                     // channel is closed
-                    if head.flags & CLOSED_FLAG == CLOSED_FLAG {
+                    if tail.flags & CLOSED_FLAG == CLOSED_FLAG {
                         return Err(io::Error::new(
                             io::ErrorKind::BrokenPipe,
                             "channel is closed",
                         ));
                     }
                     return Ok(None);
-                }
-
-                if head.block != tail.block {
-                    head.flags |= SAME_BLOCK_FLAG;
                 }
             }
 
@@ -309,22 +316,27 @@ impl<T: Send> Channel<T> {
                 SeqCst,
                 Relaxed,
             ) {
-                Ok(_) => {
+                Ok(_) => unsafe {
                     // last slot in a block
                     if head.index + 1 == BLOCK_SIZE {
-                        let next_block_ptr = unsafe { (*head.block).wait_next() };
-                        self.head.store(
-                            (head.flags & CLOSED_FLAG) | next_block_ptr as usize,
-                            Release,
-                        );
+                        let new_head = {
+                            let block = (*head.block).wait_next();
+                            // if next block is not the last one, mark head
+                            if (*block).get_next().is_some() {
+                                block as usize | CROSSED_FLAG
+                            } else {
+                                block as usize
+                            }
+                        };
+                        self.head.store(new_head as usize, Release);
                     }
 
                     // wait until write operation completes
-                    while slot.state.load(Acquire) & OCCUPIED == 0 {
+                    while slot.state.load(Acquire) & WROTE == 0 {
                         backoff.spin();
                     }
 
-                    let msg = unsafe { slot.message.get().read().assume_init() };
+                    let msg = slot.message.get().read().assume_init();
 
                     // this is the last block, so start destroying it
                     if head.index + 1 == BLOCK_SIZE {
@@ -336,7 +348,7 @@ impl<T: Send> Channel<T> {
                     }
 
                     return Ok(Some(msg));
-                }
+                },
 
                 Err(h) => {
                     head_packed = h;
@@ -359,7 +371,6 @@ impl<T: Send> Channel<T> {
     #[inline]
     fn close(&self) {
         self.tail.fetch_or(CLOSED_FLAG, AcqRel);
-        self.head.fetch_or(CLOSED_FLAG, AcqRel);
     }
 }
 
