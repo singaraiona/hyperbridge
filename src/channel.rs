@@ -289,13 +289,12 @@ impl<T: Send> Channel<T> {
                 fence(SeqCst);
                 let tail_packed = self.tail.load(Relaxed);
                 let tail: Position<T> = Position::unpack(tail_packed);
-
                 // head and tail are crossed, mark head
                 if head.block != tail.block {
                     head.flags |= CROSSED_FLAG;
                 }
                 // Nothing to read
-                else if head.index == tail.index {
+                else if head.index >= tail.index {
                     // channel is closed
                     if tail.flags & CLOSED_FLAG == CLOSED_FLAG {
                         return Err(io::Error::new(
