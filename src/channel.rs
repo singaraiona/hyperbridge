@@ -273,14 +273,14 @@ impl<T: Send> Channel<T> {
     fn try_recv(&self) -> io::Result<Option<T>> {
         let backoff = Backoff::new();
         let mut head_packed = self.head.load(Acquire);
-        let mut head: Position<T> = Position::unpack(head_packed);
 
         loop {
+            let mut head: Position<T> = Position::unpack(head_packed);
+
             // wait next block
             if head.index == BLOCK_SIZE {
                 backoff.snooze();
                 head_packed = self.head.load(Acquire);
-                head = Position::unpack(head_packed);
                 continue;
             }
 
@@ -289,12 +289,11 @@ impl<T: Send> Channel<T> {
                 fence(SeqCst);
                 let tail_packed = self.tail.load(Relaxed);
                 let tail: Position<T> = Position::unpack(tail_packed);
+
                 // head and tail are crossed, mark head
                 if head.block != tail.block {
                     head.flags |= CROSSED_FLAG;
-                }
-                // Nothing to read
-                else if head.index >= tail.index {
+                } else if head.index == tail.index {
                     // channel is closed
                     if tail.flags & CLOSED_FLAG == CLOSED_FLAG {
                         return Err(io::Error::new(
@@ -303,6 +302,10 @@ impl<T: Send> Channel<T> {
                         ));
                     }
                     return Ok(None);
+                } else {
+                    backoff.snooze();
+                    head_packed = self.head.load(Acquire);
+                    continue;
                 }
             }
 
@@ -351,7 +354,6 @@ impl<T: Send> Channel<T> {
 
                 Err(h) => {
                     head_packed = h;
-                    head = Position::unpack(head_packed);
                     backoff.spin();
                 }
             }
