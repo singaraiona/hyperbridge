@@ -302,7 +302,7 @@ impl<T: Send> Channel<T> {
                         ));
                     }
                     return Ok(None);
-                } else {
+                } else if head.index > tail.index {
                     backoff.snooze();
                     head_packed = self.head.load(Acquire);
                     continue;
