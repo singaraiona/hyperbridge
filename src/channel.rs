@@ -1,29 +1,23 @@
 use crate::util::{Backoff, CachePadded};
 use core::cell::UnsafeCell;
-use core::marker::PhantomData;
 use core::mem::MaybeUninit;
-use core::ops::Deref;
 use core::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release, SeqCst};
 use core::sync::atomic::{fence, AtomicPtr, AtomicUsize};
 use std::sync::Arc;
 use std::{fmt, io};
 
 // Slot states
-const WROTE: usize = 1;
+const WRITE: usize = 1;
 const READ: usize = 1 << 1;
 const DESTROY: usize = 1 << 2;
-// Index offset inside each block
-const INDEX_SHIFT: usize = 48;
-// In tail indicates that channel was closed
-const CLOSED_FLAG: usize = 1;
-// In head indicates that head and tail are in separate blocks
-const CROSSED_FLAG: usize = 1;
-const FLAGS: usize = CLOSED_FLAG | CROSSED_FLAG;
-const INDEX_MASK: usize = (usize::MAX << INDEX_SHIFT) & !FLAGS;
-const BLOCK_MASK: usize = !(INDEX_MASK | FLAGS);
-// Each block capacity
-const BLOCK_ROUND: usize = 64;
-const BLOCK_SIZE: usize = BLOCK_ROUND - 1;
+// Read/Write round
+const ROUND: usize = 64;
+// Block capacity
+const BLOCK_SIZE: usize = ROUND - 1;
+// In a tail means that channel has been closed
+const CLOSED_FLAG: usize = 1 << 63;
+// In a head means head and tail are in a different blocks
+const CROSSED_FLAG: usize = CLOSED_FLAG;
 
 /// A place for storing a message
 struct Slot<T> {
@@ -47,9 +41,8 @@ struct Block<T> {
 
 impl<T> Block<T> {
     /// Creates new empty block
-    fn new() -> *mut Block<T> {
-        let block: Block<T> = unsafe { MaybeUninit::zeroed().assume_init() };
-        Box::into_raw(Box::new(block))
+    fn new() -> Self {
+        unsafe { MaybeUninit::zeroed().assume_init() }
     }
 
     /// Blocks current thread waiting the next block is set
@@ -60,26 +53,23 @@ impl<T> Block<T> {
             if !next.is_null() {
                 return next;
             }
-            backoff.snooze();
+            backoff.spin();
         }
     }
 
-    /// Sets up a new next block
-    fn set_next(&self) -> *mut Block<T> {
-        debug_assert!(self.next.load(Acquire).is_null());
-        let next = Self::new();
-        self.next.store(next, Release);
-        next
+    /// Stores new one allocated block inside `next`
+    fn set_next(&self, next: *mut Block<T>) {
+        let prev = self.next.swap(next, Release);
+        debug_assert!(prev.is_null());
     }
 
-    /// Returns current next block (if any)
+    /// Returns block inside `next`
     fn get_next(&self) -> Option<*mut Block<T>> {
         let next = self.next.load(Acquire);
         if next.is_null() {
-            None
-        } else {
-            Some(next)
+            return None;
         }
+        Some(next)
     }
 
     /// Drop block if there are no readers using this block remains or leave dropping to a next thread
@@ -102,120 +92,33 @@ impl<T> Block<T> {
     }
 }
 
-/// A helper struct holds pointer to a with a slot offset and a flags
-struct Position<T> {
-    block: *mut Block<T>,
-    index: usize,
-    flags: usize,
-}
-
-impl<T> fmt::Debug for Position<T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Position")
-            .field("block", &self.block)
-            .field("index", &self.index)
-            .finish()
-    }
-}
-
-impl<T> Position<T> {
-    /// Read Position packed to a usize
-    #[inline]
-    fn unpack(val: usize) -> Self {
-        let block = (val & BLOCK_MASK) as *mut Block<T>;
-        let index = val >> INDEX_SHIFT;
-        let flags = val & FLAGS;
-        Position {
-            block,
-            index,
-            flags,
-        }
-    }
-
-    // Create Position from parts instead of plain number
-    #[inline]
-    fn from_parts(block: *mut Block<T>, index: usize, flags: usize) -> Self {
-        Position {
-            block,
-            index,
-            flags,
-        }
-    }
-
-    /// Write Position to a usize
-    #[inline]
-    fn pack(&self) -> usize {
-        self.block as usize | (self.index << INDEX_SHIFT) | self.flags
-    }
-
-    /// Move Position to a next Slot
-    #[inline]
-    fn increment(&self, n: u16) -> Self {
-        Position {
-            block: self.block,
-            index: (self.index as u16).wrapping_add(n) as usize,
-            flags: self.flags,
-        }
-    }
-
-    // Coerse index to an offset 0..BLOCK_SIZE
-    #[inline]
-    fn offset(&self) -> usize {
-        self.index & BLOCK_SIZE
-    }
-
-    /// A Slot this Position points to
-    #[inline]
-    fn slot(&self) -> &Slot<T> {
-        unsafe { &*(*self.block).slots.get_unchecked(self.offset()) }
-    }
-
-    // Positions are in a different blocks
-    #[inline]
-    fn crossed(&self, other: &Self) -> bool {
-        self.index / BLOCK_ROUND != other.index / BLOCK_ROUND
-    }
-}
-
-impl<T> PartialEq for Position<T> {
-    #[inline]
-    fn eq(&self, other: &Self) -> bool {
-        self.block as usize | (self.index << INDEX_SHIFT)
-            == other.block as usize | (other.index << INDEX_SHIFT)
-    }
-}
-
-/// An atomic position
-#[repr(transparent)]
+/// A pointer to a block/slot
+#[derive(Debug)]
 struct Cursor<T> {
-    inner: AtomicUsize,
-    _phantom: PhantomData<T>,
+    index: AtomicUsize,
+    block: AtomicPtr<Block<T>>,
 }
 
 impl<T> Cursor<T> {
-    /// Create Cursor from Position
-    #[inline]
-    fn from(position: Position<T>) -> Self {
-        debug_assert!(position.block as usize & !BLOCK_MASK == 0);
+    fn from(block: *mut Block<T>) -> Self {
         Cursor {
-            inner: AtomicUsize::new(position.block as usize | position.index << INDEX_SHIFT),
-            _phantom: PhantomData,
+            index: AtomicUsize::new(0),
+            block: AtomicPtr::new(block),
         }
     }
-}
 
-impl<T> Deref for Cursor<T> {
-    type Target = AtomicUsize;
-
-    fn deref(&self) -> &Self::Target {
-        &self.inner
+    #[inline]
+    fn slot<'a>(block: *mut Block<T>, index: usize) -> &'a Slot<T> {
+        debug_assert!(index < BLOCK_SIZE);
+        unsafe { (*block).slots.get_unchecked(index) }
     }
 }
 
 /// Unbounded channel
+#[derive(Debug)]
 struct Channel<T> {
-    tail: CachePadded<Cursor<Block<T>>>,
-    head: CachePadded<Cursor<Block<T>>>,
+    tail: CachePadded<Cursor<T>>,
+    head: CachePadded<Cursor<T>>,
 }
 
 impl<T> Drop for Channel<T> {
@@ -223,11 +126,10 @@ impl<T> Drop for Channel<T> {
         // read all unread items to drop correctly
         while let Ok(Some(_)) = self.try_recv() {}
 
-        let head_packed = self.head.load(Acquire);
-        let head: Position<T> = Position::unpack(head_packed);
+        let block = self.head.block.load(Acquire);
 
         // noone is using the block, now it is safe to destroy it.
-        unsafe { drop(Box::from_raw(head.block)) };
+        unsafe { drop(Box::from_raw(block)) };
     }
 }
 
@@ -235,9 +137,10 @@ impl<T> Channel<T> {
     /// Creates new unbounded channel
     fn new() -> Channel<T> {
         let block = Block::<T>::new();
+        let block = Box::into_raw(Box::new(block));
         Channel {
-            tail: CachePadded::new(Cursor::from(Position::unpack(block as usize))),
-            head: CachePadded::new(Cursor::from(Position::unpack(block as usize))),
+            tail: CachePadded::new(Cursor::from(block)),
+            head: CachePadded::new(Cursor::from(block)),
         }
     }
 
@@ -246,14 +149,15 @@ impl<T> Channel<T> {
     #[inline]
     fn send(&self, msg: T) -> io::Result<()> {
         let backoff = Backoff::new();
-        let mut tail_packed = self.tail.load(Acquire);
+        let mut tail = self.tail.index.load(Acquire);
+        let mut block = self.tail.block.load(Acquire);
+        let mut next_block: Option<Block<T>> = None;
 
         loop {
-            let tail: Position<T> = Position::unpack(tail_packed);
-            let offset = tail.offset();
+            let index = tail & BLOCK_SIZE;
 
             // channel is closed
-            if tail.flags & CLOSED_FLAG == CLOSED_FLAG {
+            if tail & CLOSED_FLAG == CLOSED_FLAG {
                 return Err(io::Error::new(
                     io::ErrorKind::BrokenPipe,
                     "channel is closed",
@@ -261,38 +165,43 @@ impl<T> Channel<T> {
             }
 
             // wait next block
-            if offset == BLOCK_SIZE {
+            if index == BLOCK_SIZE {
                 backoff.snooze();
-                tail_packed = self.tail.load(Acquire);
+                tail = self.tail.index.load(Acquire);
+                block = self.tail.block.load(Acquire);
                 continue;
             }
 
+            // End of block, need to setup new one as soon as possible to reduce waiting other writing threads
+            if index + 1 == BLOCK_SIZE && next_block.is_none() {
+                next_block = Some(Block::new());
+            }
+
             // try to move tail forward
-            match self.tail.compare_exchange_weak(
-                tail_packed,
-                tail.increment(1).pack(),
-                SeqCst,
-                Relaxed,
-            ) {
+            match self
+                .tail
+                .index
+                .compare_exchange_weak(tail, tail + 1, SeqCst, Relaxed)
+            {
                 Ok(_) => {
-                    let slot = tail.slot();
+                    let slot = Cursor::slot(block, index);
 
                     // End of block, need to setup new one
-                    if offset + 1 == BLOCK_SIZE {
-                        let next_block = unsafe { (*tail.block).set_next() };
-                        let new_tail: Position<T> =
-                            Position::from_parts(next_block, tail.index, 0).increment(2);
-                        self.tail.store(new_tail.pack(), Release);
+                    if index + 1 == BLOCK_SIZE {
+                        let next = Box::into_raw(Box::new(next_block.unwrap()));
+                        self.tail.block.store(next, Release);
+                        self.tail.index.fetch_add(1, Release);
+                        unsafe { (*block).set_next(next) };
                     }
 
                     unsafe { slot.message.get().write(MaybeUninit::new(msg)) };
-                    slot.state.fetch_or(WROTE, Release);
+                    slot.state.fetch_or(WRITE, Release);
                     return Ok(());
                 }
                 Err(t) => {
-                    tail_packed = t;
+                    tail = t;
+                    block = self.tail.block.load(Acquire);
                     backoff.spin();
-                    continue;
                 }
             }
         }
@@ -303,29 +212,31 @@ impl<T> Channel<T> {
     #[inline]
     fn try_recv(&self) -> io::Result<Option<T>> {
         let backoff = Backoff::new();
-        let mut head_packed = self.head.load(Acquire);
+        let mut head = self.head.index.load(Acquire);
+        let mut block = self.head.block.load(Acquire);
 
         loop {
-            let mut head: Position<T> = Position::unpack(head_packed);
-            let offset = head.offset();
+            let index = head & BLOCK_SIZE;
 
             // wait next block
-            if offset == BLOCK_SIZE {
+            if index == BLOCK_SIZE {
                 backoff.snooze();
-                head_packed = self.head.load(Acquire);
+                head = self.head.index.load(Acquire);
+                block = self.head.block.load(Acquire);
                 continue;
             }
 
-            // head and tail are (possibly) in the same block
-            if head.flags & CROSSED_FLAG == 0 {
-                fence(SeqCst);
-                let tail_packed = self.tail.load(Relaxed);
-                let tail: Position<T> = Position::unpack(tail_packed);
+            let mut new_head = head + 1;
 
-                // channel is empty
-                if head == tail {
+            // head and tail are in the same block
+            if head & CROSSED_FLAG == 0 {
+                fence(SeqCst);
+                let tail = self.tail.index.load(Relaxed);
+
+                // Nothing to read
+                if head == (tail & !CLOSED_FLAG) {
                     // channel is closed
-                    if tail.flags & CLOSED_FLAG == CLOSED_FLAG {
+                    if tail & CROSSED_FLAG != 0 {
                         return Err(io::Error::new(
                             io::ErrorKind::BrokenPipe,
                             "channel is closed",
@@ -334,58 +245,55 @@ impl<T> Channel<T> {
                     return Ok(None);
                 }
 
-                // head and tail are crossed, mark head
-                if head.crossed(&tail) {
-                    head.flags |= CROSSED_FLAG;
+                // mark head that it is in a different blocks with tail
+                if head / ROUND != (tail & !CLOSED_FLAG) / ROUND {
+                    new_head |= CROSSED_FLAG;
                 }
             }
 
             // try to move head forward
-            match self.head.compare_exchange_weak(
-                head_packed,
-                head.increment(1).pack(),
-                SeqCst,
-                Relaxed,
-            ) {
+            match self
+                .head
+                .index
+                .compare_exchange_weak(head, new_head, SeqCst, Relaxed)
+            {
                 Ok(_) => unsafe {
                     // last slot in a block
-                    if offset + 1 == BLOCK_SIZE {
-                        let next_block = (*head.block).wait_next();
-                        // if next block is not the last one, mark head
-                        let flags = if (*next_block).get_next().is_some() {
-                            CROSSED_FLAG
+                    if index + 1 == BLOCK_SIZE {
+                        let next_block = (*block).wait_next();
+                        if (*next_block).get_next().is_some() {
+                            new_head |= CROSSED_FLAG;
                         } else {
-                            0
-                        };
-
-                        let new_head: Position<T> =
-                            Position::from_parts(next_block, head.index, flags).increment(2);
-                        self.head.store(new_head.pack(), Release);
+                            new_head &= !CROSSED_FLAG;
+                        }
+                        self.head.block.store(next_block, Release);
+                        self.head.index.store(new_head + 1, Release);
                     }
 
-                    let slot = head.slot();
+                    let slot = Cursor::slot(block, index);
 
                     // wait until write operation completes
-                    while slot.state.load(Acquire) & WROTE == 0 {
+                    while slot.state.load(Acquire) & WRITE == 0 {
                         backoff.spin();
                     }
 
                     let msg = slot.message.get().read().assume_init();
 
                     // this is the last block, so start destroying it
-                    if offset + 1 == BLOCK_SIZE {
-                        Block::destroy(head.block, 0);
+                    if index + 1 == BLOCK_SIZE {
+                        Block::destroy(block, 0);
                     }
                     // someone started block destroy
                     else if slot.state.fetch_or(READ, AcqRel) & DESTROY != 0 {
-                        Block::destroy(head.block, offset + 1);
+                        Block::destroy(block, index + 1);
                     }
 
                     return Ok(Some(msg));
                 },
 
                 Err(h) => {
-                    head_packed = h;
+                    head = h;
+                    block = self.head.block.load(Acquire);
                     backoff.spin();
                 }
             }
@@ -395,31 +303,15 @@ impl<T> Channel<T> {
     /// Check if there are no mesages in a channel
     #[inline]
     fn is_empty(&self) -> bool {
-        let head = self.head.load(SeqCst);
-        let tail = self.tail.load(SeqCst);
-        head == tail
+        let head = self.head.index.load(SeqCst);
+        let tail = self.tail.index.load(SeqCst);
+        head & !CROSSED_FLAG == tail & !CLOSED_FLAG
     }
 
     // Closes a channel
     #[inline]
     fn close(&self) {
-        self.tail.fetch_or(CLOSED_FLAG, AcqRel);
-    }
-}
-
-impl<T> fmt::Debug for Channel<T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let head: Position<Slot<T>> = Position::unpack(self.head.load(Acquire));
-        let tail: Position<Slot<T>> = Position::unpack(self.tail.load(Acquire));
-
-        let slot = head.slot();
-        let state = slot.state.load(Acquire);
-
-        f.debug_struct("Channel")
-            .field("head", &head)
-            .field("tail", &tail)
-            .field("slot", &state)
-            .finish()
+        self.tail.index.fetch_or(CLOSED_FLAG, AcqRel);
     }
 }
 
@@ -437,7 +329,7 @@ pub struct Sender<T> {
     pub(crate) cnts: Arc<Counters>,
 }
 
-impl<T> fmt::Debug for Sender<T> {
+impl<T: fmt::Debug> fmt::Debug for Sender<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{:?}", self.chan)
     }

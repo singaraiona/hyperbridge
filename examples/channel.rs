@@ -22,7 +22,9 @@ fn main() {
 
     while iters > 0 {
         match receiver.try_recv() {
-            Ok(Some(_)) => {
+            Ok(Some(v)) => {
+                println!("RECV: {}", v);
+                counter += v as usize;
                 iters -= 1;
             }
             _ => {}

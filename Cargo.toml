@@ -1,6 +1,6 @@
 [package]
 name = "hyperbridge"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2018"
 authors = ["Anton Kundenko <singaraiona@gmail.com>"]
 description = "Fast multi-producer multi-consumer channel with async support"
