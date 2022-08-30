@@ -41,8 +41,9 @@ struct Block<T> {
 
 impl<T> Block<T> {
     /// Creates new empty block
-    fn new() -> Self {
-        unsafe { MaybeUninit::zeroed().assume_init() }
+    fn new() -> *mut Self {
+        let block = unsafe { MaybeUninit::zeroed().assume_init() };
+        Box::into_raw(Box::new(block))
     }
 
     /// Blocks current thread waiting the next block is set
@@ -137,7 +138,6 @@ impl<T> Channel<T> {
     /// Creates new unbounded channel
     fn new() -> Channel<T> {
         let block = Block::<T>::new();
-        let block = Box::into_raw(Box::new(block));
         Channel {
             tail: CachePadded::new(Cursor::from(block)),
             head: CachePadded::new(Cursor::from(block)),
@@ -151,7 +151,6 @@ impl<T> Channel<T> {
         let backoff = Backoff::new();
         let mut tail = self.tail.index.load(Acquire);
         let mut block = self.tail.block.load(Acquire);
-        let mut next_block: Option<Block<T>> = None;
 
         loop {
             let index = tail & BLOCK_SIZE;
@@ -172,11 +171,6 @@ impl<T> Channel<T> {
                 continue;
             }
 
-            // End of block, need to setup new one as soon as possible to reduce waiting other writing threads
-            if index + 1 == BLOCK_SIZE && next_block.is_none() {
-                next_block = Some(Block::new());
-            }
-
             // try to move tail forward
             match self
                 .tail
@@ -188,7 +182,7 @@ impl<T> Channel<T> {
 
                     // End of block, need to setup new one
                     if index + 1 == BLOCK_SIZE {
-                        let next = Box::into_raw(Box::new(next_block.unwrap()));
+                        let next = Block::new();
                         self.tail.block.store(next, Release);
                         self.tail.index.fetch_add(1, Release);
                         unsafe { (*block).set_next(next) };
@@ -234,14 +228,15 @@ impl<T> Channel<T> {
                 let tail = self.tail.index.load(Relaxed);
 
                 // Nothing to read
-                if head == (tail & !CLOSED_FLAG) {
+                if head == tail & !CLOSED_FLAG {
                     // channel is closed
-                    if tail & CROSSED_FLAG != 0 {
+                    if tail & CLOSED_FLAG != 0 {
                         return Err(io::Error::new(
                             io::ErrorKind::BrokenPipe,
                             "channel is closed",
                         ));
                     }
+
                     return Ok(None);
                 }
 
