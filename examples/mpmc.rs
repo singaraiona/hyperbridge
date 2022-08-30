@@ -44,8 +44,4 @@ fn main() {
     let total: usize = (0..threads).map(|i| i * values).sum();
 
     println!("Send and received: {} items", total);
-
-    for i in 0..10000 {
-        receiver.try_recv();
-    }
 }

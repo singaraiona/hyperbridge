@@ -3,7 +3,6 @@ use std::thread;
 
 fn main() {
     let (sender, receiver) = hyperbridge::channel::new();
-    let mut counter = 0;
     let threads = 10;
     let values = 10000;
 
@@ -23,8 +22,7 @@ fn main() {
 
     while iters > 0 {
         match receiver.try_recv() {
-            Ok(Some(v)) => {
-                counter += v as usize;
+            Ok(Some(_)) => {
                 iters -= 1;
             }
             _ => {}
