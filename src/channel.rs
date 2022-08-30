@@ -7,17 +7,17 @@ use std::sync::Arc;
 use std::{fmt, io};
 
 // Slot states
-const WROTE: usize = 1;
+const WRITE: usize = 1;
 const READ: usize = 1 << 1;
 const DESTROY: usize = 1 << 2;
 // Read/Write round
 const ROUND: usize = 64;
 // Block capacity
 const BLOCK_SIZE: usize = ROUND - 1;
-// Has two different purposes:
-// * If set in head, indicates that the block is not the last one.
-// * If set in tail, indicates that the channel is disconnected.
-const MARK_BIT: usize = 1 << 63;
+// In a tail means that channel has been closed
+const CLOSED_FLAG: usize = 1 << 63;
+// In a head means head and tail are in a different blocks
+const CROSSED_FLAG: usize = CLOSED_FLAG;
 
 /// A place for storing a message
 struct Slot<T> {
@@ -61,6 +61,15 @@ impl<T> Block<T> {
     fn set_next(&self, next: *mut Block<T>) {
         let prev = self.next.swap(next, Release);
         debug_assert!(prev.is_null());
+    }
+
+    /// Returns block inside `next`
+    fn get_next(&self) -> Option<*mut Block<T>> {
+        let next = self.next.load(Acquire);
+        if next.is_null() {
+            return None;
+        }
+        Some(next)
     }
 
     /// Drop block if there are no readers using this block remains or leave dropping to a next thread
@@ -114,18 +123,15 @@ struct Channel<T> {
 
 impl<T> Drop for Channel<T> {
     fn drop(&mut self) {
-        // // read all unread items to drop correctly
-        // while let Ok(Some(_)) = self.try_recv() {}
+        // read all unread items to drop correctly
+        while let Ok(Some(_)) = self.try_recv() {}
 
-        // let block = self.head.block.load(Acquire);
+        let block = self.head.block.load(Acquire);
 
-        // // noone is using the block, now it is safe to destroy it.
-        // unsafe { drop(Box::from_raw(block)) };
+        // noone is using the block, now it is safe to destroy it.
+        unsafe { drop(Box::from_raw(block)) };
     }
 }
-
-// unsafe impl<T: Send> Sync for Channel<T> {}
-// unsafe impl<T: Send> Send for Channel<T> {}
 
 impl<T> Channel<T> {
     /// Creates new unbounded channel
@@ -151,7 +157,7 @@ impl<T> Channel<T> {
             let index = tail & BLOCK_SIZE;
 
             // channel is closed
-            if tail & MARK_BIT == MARK_BIT {
+            if tail & CLOSED_FLAG == CLOSED_FLAG {
                 return Err(io::Error::new(
                     io::ErrorKind::BrokenPipe,
                     "channel is closed",
@@ -189,7 +195,7 @@ impl<T> Channel<T> {
                     }
 
                     unsafe { slot.message.get().write(MaybeUninit::new(msg)) };
-                    slot.state.fetch_or(WROTE, Release);
+                    slot.state.fetch_or(WRITE, Release);
                     return Ok(());
                 }
                 Err(t) => {
@@ -223,14 +229,14 @@ impl<T> Channel<T> {
             let mut new_head = head + 1;
 
             // head and tail are in the same block
-            if head & MARK_BIT == 0 {
+            if head & CROSSED_FLAG == 0 {
                 fence(SeqCst);
                 let tail = self.tail.index.load(Relaxed);
 
                 // Nothing to read
-                if head == (tail & !MARK_BIT) {
+                if head == (tail & !CLOSED_FLAG) {
                     // channel is closed
-                    if tail & MARK_BIT != 0 {
+                    if tail & CROSSED_FLAG != 0 {
                         return Err(io::Error::new(
                             io::ErrorKind::BrokenPipe,
                             "channel is closed",
@@ -240,8 +246,8 @@ impl<T> Channel<T> {
                 }
 
                 // mark head that it is in a different blocks with tail
-                if head / ROUND != (tail & !MARK_BIT) / ROUND {
-                    new_head |= MARK_BIT;
+                if head / ROUND != (tail & !CLOSED_FLAG) / ROUND {
+                    new_head |= CROSSED_FLAG;
                 }
             }
 
@@ -251,10 +257,15 @@ impl<T> Channel<T> {
                 .index
                 .compare_exchange_weak(head, new_head, SeqCst, Relaxed)
             {
-                Ok(_) => {
+                Ok(_) => unsafe {
                     // last slot in a block
                     if index + 1 == BLOCK_SIZE {
-                        let next_block = unsafe { (*block).wait_next() };
+                        let next_block = (*block).wait_next();
+                        if (*next_block).get_next().is_some() {
+                            new_head |= CROSSED_FLAG;
+                        } else {
+                            new_head &= !CROSSED_FLAG;
+                        }
                         self.head.block.store(next_block, Release);
                         self.head.index.store(new_head + 1, Release);
                     }
@@ -262,11 +273,11 @@ impl<T> Channel<T> {
                     let slot = Cursor::slot(block, index);
 
                     // wait until write operation completes
-                    while slot.state.load(Acquire) & WROTE == 0 {
+                    while slot.state.load(Acquire) & WRITE == 0 {
                         backoff.spin();
                     }
 
-                    let msg = unsafe { slot.message.get().read().assume_init() };
+                    let msg = slot.message.get().read().assume_init();
 
                     // this is the last block, so start destroying it
                     if index + 1 == BLOCK_SIZE {
@@ -278,7 +289,7 @@ impl<T> Channel<T> {
                     }
 
                     return Ok(Some(msg));
-                }
+                },
 
                 Err(h) => {
                     head = h;
@@ -294,13 +305,13 @@ impl<T> Channel<T> {
     fn is_empty(&self) -> bool {
         let head = self.head.index.load(SeqCst);
         let tail = self.tail.index.load(SeqCst);
-        head & !MARK_BIT == tail & !MARK_BIT
+        head & !CROSSED_FLAG == tail & !CLOSED_FLAG
     }
 
     // Closes a channel
     #[inline]
     fn close(&self) {
-        self.tail.index.fetch_or(MARK_BIT, AcqRel);
+        self.tail.index.fetch_or(CLOSED_FLAG, AcqRel);
     }
 }
 
@@ -324,7 +335,7 @@ impl<T: fmt::Debug> fmt::Debug for Sender<T> {
     }
 }
 
-impl<T: Send + 'static> Sender<T> {
+impl<T> Sender<T> {
     #[inline]
     pub fn send(&self, item: T) -> io::Result<()> {
         self.chan.send(item)
@@ -348,7 +359,7 @@ impl<T: Send + 'static> Sender<T> {
     }
 }
 
-impl<T: Send + 'static> Clone for Sender<T> {
+impl<T> Clone for Sender<T> {
     fn clone(&self) -> Self {
         self.cnts.senders.fetch_add(1, SeqCst);
         Sender {
@@ -368,15 +379,15 @@ impl<T> Drop for Sender<T> {
     }
 }
 
-unsafe impl<T: Send + 'static> Send for Sender<T> {}
+unsafe impl<T> Send for Sender<T> {}
 
 /// Rx handle to a channel. Can be cloned
-pub struct Receiver<T: Send + 'static> {
+pub struct Receiver<T> {
     chan: Arc<Channel<T>>,
     pub(crate) cnts: Arc<Counters>,
 }
 
-impl<T: Send + 'static> Receiver<T> {
+impl<T> Receiver<T> {
     #[inline]
     pub fn try_recv(&self) -> io::Result<Option<T>> {
         self.chan.try_recv()
@@ -391,7 +402,7 @@ impl<T: Send + 'static> Receiver<T> {
     }
 }
 
-impl<T: Send + 'static> Clone for Receiver<T> {
+impl<T> Clone for Receiver<T> {
     fn clone(&self) -> Self {
         self.cnts.receivers.fetch_add(1, SeqCst);
         Receiver {
@@ -401,7 +412,7 @@ impl<T: Send + 'static> Clone for Receiver<T> {
     }
 }
 
-impl<T: Send + 'static> Drop for Receiver<T> {
+impl<T> Drop for Receiver<T> {
     fn drop(&mut self) {
         let receivers = self.cnts.receivers.fetch_sub(1, SeqCst);
         // if it was the last receiver - close channel
@@ -411,10 +422,10 @@ impl<T: Send + 'static> Drop for Receiver<T> {
     }
 }
 
-unsafe impl<T: Send + 'static> Send for Receiver<T> {}
+unsafe impl<T> Send for Receiver<T> {}
 
 /// Creates a new channel and splits it ro a Tx, Rx pair
-pub fn new<T: Send + 'static>() -> (Sender<T>, Receiver<T>) {
+pub fn new<T>() -> (Sender<T>, Receiver<T>) {
     let chan = Arc::new(Channel::new());
     let cnts = Arc::new(Counters {
         receivers: AtomicUsize::new(1),

@@ -8,12 +8,12 @@ use std::pin::Pin;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-pub struct Sender<T: Send + 'static> {
+pub struct Sender<T> {
     tx: channel::Sender<T>,
     rx_waker: Arc<AtomicWaker>,
 }
 
-impl<T: Send + 'static> Clone for Sender<T> {
+impl<T> Clone for Sender<T> {
     fn clone(&self) -> Self {
         Sender {
             tx: self.tx.clone(),
@@ -24,7 +24,7 @@ impl<T: Send + 'static> Clone for Sender<T> {
 
 impl<T> Sink<T> for Sender<T>
 where
-    T: Send + Unpin + 'static,
+    T: Unpin + 'static,
 {
     type Error = io::Error;
 
@@ -48,7 +48,7 @@ where
     }
 }
 
-impl<T: Send + 'static> Drop for Sender<T> {
+impl<T> Drop for Sender<T> {
     fn drop(&mut self) {
         // check if it was the last sender
         let senders = self.tx.cnts.senders.load(Ordering::SeqCst);
@@ -60,12 +60,12 @@ impl<T: Send + 'static> Drop for Sender<T> {
     }
 }
 
-pub struct Receiver<T: Send + 'static> {
+pub struct Receiver<T> {
     rx: channel::Receiver<T>,
     waker: Arc<AtomicWaker>,
 }
 
-impl<T: Send + 'static> Receiver<T> {
+impl<T> Receiver<T> {
     #[inline]
     fn next_message(&self) -> Poll<Option<Result<T, io::Error>>> {
         match self.rx.try_recv() {
@@ -77,7 +77,7 @@ impl<T: Send + 'static> Receiver<T> {
     }
 }
 
-impl<T: Send + 'static> Stream for Receiver<T> {
+impl<T> Stream for Receiver<T> {
     type Item = Result<T, io::Error>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -91,7 +91,7 @@ impl<T: Send + 'static> Stream for Receiver<T> {
     }
 }
 
-pub fn new<T: Send + 'static>() -> (Sender<T>, Receiver<T>) {
+pub fn new<T>() -> (Sender<T>, Receiver<T>) {
     let (tx, rx) = channel::new();
     let rx_waker = Arc::new(AtomicWaker::new());
     let tx = Sender {
